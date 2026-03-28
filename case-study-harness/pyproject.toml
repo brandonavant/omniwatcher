@@ -1,0 +1,16 @@
+[project]
+name = "case-study-harness"
+version = "0.1.0"
+requires-python = ">=3.12"
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+files = ["scripts", "install.py"]
+
+[tool.ruff]
+target-version = "py313"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "A", "SIM"]
