@@ -18,9 +18,8 @@ this repo, or MCP index tools.
 ## What to Verify
 
 - **Frontmatter fields**: Use only fields documented in the official docs. Do not invent fields.
-- **`paths` frontmatter vs. unconditional**: Path-scoped rules only trigger when Claude reads a file matching the
-  pattern. They will **not** fire when creating net-new files. If a rule must apply during file creation (not just
-  editing), omit the `paths` frontmatter so the rule loads unconditionally.
+- **`paths` frontmatter vs. unconditional**: Before adding `paths` frontmatter, consult the `rule-scoping-decisions.md`
+  rule for guidance on when scoping is appropriate vs. when the rule should load unconditionally.
 - **Directory structure**: Place files in the exact directories the docs specify (e.g., `SKILL.md` as the
   entry point, not `skill.md` or `index.md`).
 - **File naming**: Follow documented naming conventions exactly.
