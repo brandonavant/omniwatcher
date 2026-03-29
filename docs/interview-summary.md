@@ -90,6 +90,13 @@ that the user never falls back to doing the work manually.
 - Advanced collaboration features (shared watchers, team features)
 - Sophisticated source-authority modeling beyond basic signal/noise filtering
 
+## Retrospective Notes
+
+- **2026-03-28 -- Google Calendar integration dropped from MVP.** The conditional-reminders feature (item 6 under MVP
+  Features) relied on Google Calendar as the only third-party integration. After further consideration, this was judged
+  too much scope for the initial release. Calendar-triggered reminders remain a strong candidate for a fast-follow but
+  are not part of the MVP build. The PRD reflects this change.
+
 ## Deployment
 
 - **Cloud:** Azure (personal subscription)
