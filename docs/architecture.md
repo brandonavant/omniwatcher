@@ -807,13 +807,13 @@ Resource Group: rg-omniwatcher-{env}
 │   └── Activity functions (check executor, webhook delivery)
 ├── Container Apps Environment: cae-omniwatcher-{env}
 │   └── Container App: ca-omniwatcher-web-{env}       (Next.js + Better Auth)
-├── PostgreSQL Flexible Server: pg-omniwatcher-{env}   (B1ms, 32 GB Premium SSD)
+├── PostgreSQL Flexible Server: psql-omniwatcher-{env}  (B1ms, 32 GB Premium SSD)
 ├── Azure OpenAI: oai-omniwatcher-{env}                (GPT-5.4 Nano + GPT-5.4 mini deployments)
 ├── Foundry Hub: hub-omniwatcher-{env}                 (Safety evaluators, free management layer)
 │   └── Foundry Project: proj-omniwatcher-{env}
 ├── Storage Account: stomniwatcher{env}               (Durable Functions state + general storage)
 ├── Key Vault: kv-omniwatcher-{env}
-└── Application Insights: ai-omniwatcher-{env}
+└── Application Insights: appi-omniwatcher-{env}
 ```
 
 ### Estimated Monthly Cost (Production)
