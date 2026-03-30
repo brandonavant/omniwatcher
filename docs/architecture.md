@@ -2,12 +2,12 @@
 
 ## Document Header
 
-| Field          | Value                                         |
-|----------------|-----------------------------------------------|
-| Version        | v2.0                                          |
-| Date           | 2026-03-29                                    |
-| Author         | Brandon Avant                                 |
-| Change Summary | Full rewrite after web-researched tech review |
+| Field          | Value                                                                    |
+|----------------|--------------------------------------------------------------------------|
+| Version        | v2.1                                                                     |
+| Date           | 2026-03-29                                                               |
+| Author         | Brandon Avant                                                            |
+| Change Summary | Add Microsoft Foundry + Azure OpenAI resource to deployment architecture |
 
 ---
 
@@ -33,6 +33,7 @@
 | LLM SDK            | openai (Python)                  | Latest  | Configured for Azure OpenAI endpoints                  |
 | LLM evals          | Pydantic Evals                   | 1.x     | Python-native, CI-integrated, typed datasets           |
 | LLM quality evals  | azure-ai-evaluation              | Latest  | Groundedness, coherence, safety evaluators             |
+| LLM eval platform  | Microsoft Foundry                | N/A     | Required for safety evaluators; free management layer  |
 | Eval observability | Pydantic Logfire                 | Latest  | Free tier (10M spans/month), LLM tracing               |
 | Rate limiting      | Custom middleware                | N/A     | Sliding window counter backed by PostgreSQL            |
 | API compute        | Azure Functions Flex Consumption | N/A     | FastAPI via AsgiFunctionApp, scale to zero             |
@@ -160,9 +161,17 @@ This is the core domain logic of OmniWatcher. Each watcher check follows this pi
 Each active watcher has a dedicated Durable Functions eternal orchestration. The orchestration loop:
 
 1. Read the watcher's schedule configuration from PostgreSQL.
-2. Calculate `next_check_time` based on the schedule (frequency, preferred time, timezone, day-of-week rules).
-   This is arbitrary Python -- any schedule expressible in code is supported (daily at 09:00, weekdays only,
-   first Monday of the month, etc.).
+2. Calculate `next_check_time` based on the schedule type:
+    - **`frequency`:** Advance from the `preferredTime` anchor by `frequencyHours` intervals until the next future
+      occurrence.
+    - **`days_of_week`:** Find the next day in `days` whose scheduled `times` entry is still in the future; if none
+      remain today, advance to the first time on the next matching day.
+    - **`specific_date`:** The target datetime is the `next_check_time`. If already past, the orchestration signals the
+      entity to pause the watcher and exits without calling `continue_as_new`.
+
+   All calculations use `ctx.current_utc_datetime` and the schedule's IANA timezone. Adding new schedule types (e.g.,
+   nth-weekday for "first Monday of the month") requires only a new discriminated-union variant and a corresponding
+   `next_check_time` branch.
 3. `yield ctx.create_timer(next_check_time)` -- the orchestration sleeps until that exact moment. Zero compute
    is consumed while sleeping; the Durable Task Framework manages the wake-up via its internal storage queue.
 4. Invoke the check executor activity function.
@@ -311,12 +320,12 @@ Two complementary evaluation tools, both Python-native:
 
 Four evaluation suites, one per LLM-driven task:
 
-| Suite                  | Test Cases                                                 | Key Assertions                             |
-|------------------------|------------------------------------------------------------|--------------------------------------------|
-| Watcher prompt parsing | Simple, complex, ambiguous, adversarial descriptions       | Correct field extraction, no hallucination |
-| Change detection       | No change, cosmetic change, meaningful change, adversarial | Correct decision, accurate summary         |
-| Relevance filtering    | Official source, news, forum, spam, tangential             | Correct quality tier assignment            |
-| Alert generation       | Various change types; history context for dedup testing    | Accuracy, length, attribution, no repeat   |
+| Suite                  | Test Cases                                                                                                                    | Key Assertions                                                              |
+|------------------------|-------------------------------------------------------------------------------------------------------------------------------|-----------------------------------------------------------------------------|
+| Watcher prompt parsing | Simple, complex, ambiguous, adversarial descriptions; all three schedule types (`frequency`, `days_of_week`, `specific_date`) | Correct field extraction, correct schedule type selection, no hallucination |
+| Change detection       | No change, cosmetic change, meaningful change, adversarial                                                                    | Correct decision, accurate summary                                          |
+| Relevance filtering    | Official source, news, forum, spam, tangential                                                                                | Correct quality tier assignment                                             |
+| Alert generation       | Various change types; history context for dedup testing                                                                       | Accuracy, length, attribution, no repeat                                    |
 
 Pydantic Evals uses typed `Case` and `Dataset` objects with Pydantic v2 models, integrating naturally with the
 existing FastAPI schema definitions. Built-in evaluators include `EqualsExpected`, `Contains`, `LLMJudge`,
@@ -379,8 +388,11 @@ Addresses N-11 (LLM security and prompt injection mitigation). Defense-in-depth 
 When a user creates a watcher, the system performs a multi-step onboarding before the watcher goes live.
 
 1. **Prompt parsing (LLM -- GPT-5.4 Nano):** Extract topic, change triggers, and requested schedule from the user's
-   natural-language description. If the description is ambiguous or incomplete (no clear topic, no identifiable
-   change triggers), return clarification questions instead of proceeding.
+   natural-language description. The schedule is produced as one of the three discriminated-union types (`frequency`,
+   `days_of_week`, or `specific_date`); if no schedule is mentioned, the LLM defaults to
+   `{"type": "frequency", "frequencyHours": 24, "preferredTime": "09:00"}` using the user's profile timezone. If the
+   description is ambiguous or incomplete (no clear topic, no identifiable change triggers), return clarification
+   questions instead of proceeding.
 
 2. **Source discovery (Tavily):** Run targeted web searches based on the extracted topic. Discover relevant,
    authoritative sources (official sites, publisher pages, prominent community hubs).
@@ -389,11 +401,14 @@ When a user creates a watcher, the system performs a multi-step onboarding befor
    and likely authority. Assign a trust level (`high`, `medium`, `low`). Filter out low-quality results.
 
 4. **User confirmation:** Present the parsed watcher configuration (topic, triggers, schedule) and the discovered
-   source list to the user. The user can accept, remove, or add sources. The user can also adjust the parsed
-   triggers and schedule.
+   source list to the user. The schedule is rendered type-specifically: `frequency` as "Every N hours at HH:MM TZ",
+   `days_of_week` as "Mon, Wed, Fri at HH:MM TZ", `specific_date` as "Once on YYYY-MM-DD at HH:MM TZ". The user can
+   accept, remove, or add sources. The user can also adjust the parsed triggers and schedule.
 
 5. **Activation:** Once the user confirms, the watcher is created with `status = 'active'` and `next_check_at`
-   set to the first scheduled check time. No watcher activates with unresolved ambiguity (F-01 AC-05, AC-06).
+   set to the first scheduled check time. For `specific_date` schedules, `next_check_at` is the specified datetime;
+   after the one-shot check completes, the watcher transitions to `'paused'`. No watcher activates with unresolved
+   ambiguity (F-01 AC-05, AC-06).
 
 ## 6. Data Models
 
@@ -469,18 +484,78 @@ manually.
 A `url` source is a specific page re-fetched on each check. A `search` source is a query run via Tavily on each
 check to discover new content (the PRD's "discoverable location" concept).
 
-**Schedule JSONB schema:**
+**Schedule JSONB schema (discriminated union on `type`):**
+
+*Type `frequency` -- interval-based checks:*
 
 ```json
 {
+  "type": "frequency",
   "frequencyHours": 24,
   "preferredTime": "09:00",
   "timezone": "America/Chicago"
 }
 ```
 
-`frequencyHours` minimum is 1 (per N-03). `preferredTime` and `timezone` determine the anchor point. For
-sub-daily frequencies, checks are spaced evenly from the preferred time.
+| Field            | Type    | Required | Constraints                                         |
+|------------------|---------|----------|-----------------------------------------------------|
+| `type`           | string  | Yes      | Literal `"frequency"`                               |
+| `frequencyHours` | integer | Yes      | [1, 168]. Minimum 1 per N-03.                       |
+| `preferredTime`  | string  | Yes      | `HH:MM`, 24-hour. Anchor point for the interval.    |
+| `timezone`       | string  | Yes      | IANA timezone identifier (e.g., `America/Chicago`). |
+
+Checks fire every `frequencyHours` hours, anchored to `preferredTime`. For sub-daily frequencies, checks are spaced
+evenly from the preferred time (e.g., `frequencyHours: 6` with `preferredTime: "09:00"` yields 09:00, 15:00, 21:00,
+03:00).
+
+*Type `days_of_week` -- checks on specific weekdays at explicit times:*
+
+```json
+{
+  "type": "days_of_week",
+  "days": [
+    1,
+    3,
+    5
+  ],
+  "times": [
+    "09:00"
+  ],
+  "timezone": "America/Chicago"
+}
+```
+
+| Field      | Type            | Required | Constraints                                                                                                  |
+|------------|-----------------|----------|--------------------------------------------------------------------------------------------------------------|
+| `type`     | string          | Yes      | Literal `"days_of_week"`                                                                                     |
+| `days`     | array of int    | Yes      | ISO 8601 weekdays (1=Mon .. 7=Sun). 1-7 items, no duplicates, sorted asc.                                    |
+| `times`    | array of string | Yes      | `HH:MM`, 24-hour. 1-6 items, no duplicates, sorted asc. Consecutive entries must differ by >= 60 min (N-03). |
+| `timezone` | string          | Yes      | IANA timezone identifier.                                                                                    |
+
+Checks fire at each time in `times` on each day in `days`. Example: `days: [1,2,3,4,5]` with `times: ["09:00"]` means
+weekdays at 09:00. Sub-daily patterns like "every 4 hours on weekdays" are expressed with explicit times (e.g.,
+`times: ["01:00","05:00","09:00","13:00","17:00","21:00"]`).
+
+*Type `specific_date` -- one-shot check on a single date:*
+
+```json
+{
+  "type": "specific_date",
+  "date": "2026-04-15",
+  "time": "09:00",
+  "timezone": "America/Chicago"
+}
+```
+
+| Field      | Type   | Required | Constraints                                           |
+|------------|--------|----------|-------------------------------------------------------|
+| `type`     | string | Yes      | Literal `"specific_date"`                             |
+| `date`     | string | Yes      | `YYYY-MM-DD`. Must be in the future at creation time. |
+| `time`     | string | Yes      | `HH:MM`, 24-hour.                                     |
+| `timezone` | string | Yes      | IANA timezone identifier.                             |
+
+A single check fires at `time` on `date`. After the check completes, the orchestration signals the entity to pause the
+watcher. The watcher remains visible in the user's list as paused.
 
 **Soft delete:** Setting `status` to `'deleted'` and `deleted_at` to the current timestamp. Deleted watchers are
 excluded from scheduler queries and all default UI queries. A periodic cleanup job hard-deletes watchers (and their
@@ -589,8 +664,8 @@ Auth endpoints (`/api/auth/*`) are handled by Better Auth in the Next.js layer, 
 
 ### Auth Implementation
 
-Authentication is handled by Better Auth running in the Next.js frontend layer. This is the same proven pattern
-used in the ai-roleplay project. Better Auth manages all auth complexity: registration, login, logout, password
+Authentication is handled by Better Auth running in the Next.js frontend layer. Better Auth manages all auth complexity:
+registration, login, logout, password
 reset, session management, and future OAuth providers.
 
 - **Library:** Better Auth 1.x with the `pg` database adapter (first-class PostgreSQL support).
@@ -633,7 +708,7 @@ access their own watchers, alerts, and webhook destinations. There is no cross-u
 | Auth.js (NextAuth)      | Rejected     | Maintenance mode (absorbed by Better Auth Sept 2025), JWT-only for creds |
 | fastapi-users           | Rejected     | Maintenance mode, no new features, successor unnamed                     |
 | FastAPI-native (pwdlib) | Rejected     | Hand-rolls what Better Auth provides out of the box                      |
-| **Better Auth**         | **Selected** | Proven in ai-roleplay, first-class pg adapter, active development        |
+| **Better Auth**         | **Selected** | Full-featured, first-class pg adapter, active development                |
 
 ## 9. Webhook Delivery
 
@@ -671,11 +746,47 @@ adapters. Both destination types are HTTPS POSTs. This resolves PRD OQ-02: yes, 
 }
 ```
 
+### Discord Webhook Payload
+
+The destination URL stored in `webhook_destinations.url` is the full Discord webhook URL
+(`https://discord.com/api/webhooks/{id}/{token}`), provided by Discord when the user creates a webhook in a channel. No
+additional authentication is needed -- the token is embedded in the URL.
+
+```json
+{
+  "content": "**Short alert title**\n\nMarkdown summary of what changed and why it matters...\n\n[Source](https://...)",
+  "username": "OmniWatcher"
+}
+```
+
+Field usage:
+
+- **`content`** (required): The alert title (bold), summary, and source URLs formatted as Discord-flavored Markdown.
+  Source URLs rendered as inline links. Must stay within Discord's 2000-character message limit (the 1500-character
+  summary constraint in Alert Payload Constraints ensures this).
+- **`username`** (optional): Hardcoded to `"OmniWatcher"`. Overrides the webhook's default display name so alerts are
+  identifiable regardless of how the user named the webhook in Discord.
+- Not used at MVP: `embeds`, `avatar_url`, `tts`, `components`. Plain `content` with Markdown is sufficient and
+  maintains format parity with generic destinations.
+
+### Success Criteria
+
+A delivery attempt is successful when the destination returns an HTTP response indicating the message was accepted:
+
+- **Generic webhook:** HTTP 2xx (any 200-level status).
+- **Discord webhook:** HTTP 204 No Content (Discord's default success response).
+
+Results are evaluated per destination. The alert's `delivered` flag is set to `true` if at least one destination
+succeeds. It remains `false` only when every destination fails after exhausting retries.
+
 ### Retry Policy
 
 - On 5xx or network error: retry up to 3 times with exponential backoff (1 s, 4 s, 16 s).
-- On 4xx: no retry (client error, likely a misconfigured destination).
-- After all retries exhausted: mark delivery as failed. The alert row records `delivered = false`.
+- On 429 (rate limit): retry after the delay specified in the response's `Retry-After` header (or `retry_after` JSON
+  body field for Discord). 429 retries share the same 3-retry budget as 5xx retries.
+- On other 4xx: no retry (client error, likely a misconfigured destination).
+- After all retries exhausted for a destination: mark that delivery as failed. The alert's `delivered` flag is set per
+  the success criteria above.
 - No dead-letter queue at MVP. Failed deliveries are visible in the watcher's alert history.
 
 ### Alert Payload Constraints
@@ -697,6 +808,9 @@ Resource Group: rg-omniwatcher-{env}
 ├── Container Apps Environment: cae-omniwatcher-{env}
 │   └── Container App: ca-omniwatcher-web-{env}       (Next.js + Better Auth)
 ├── PostgreSQL Flexible Server: pg-omniwatcher-{env}   (B1ms, 32 GB Premium SSD)
+├── Azure OpenAI: oai-omniwatcher-{env}                (GPT-5.4 Nano + GPT-5.4 mini deployments)
+├── Foundry Hub: hub-omniwatcher-{env}                 (Safety evaluators, free management layer)
+│   └── Foundry Project: proj-omniwatcher-{env}
 ├── Storage Account: stomniwatcher{env}               (Durable Functions state + general storage)
 ├── Key Vault: kv-omniwatcher-{env}
 └── Application Insights: ai-omniwatcher-{env}
@@ -704,17 +818,20 @@ Resource Group: rg-omniwatcher-{env}
 
 ### Estimated Monthly Cost (Production)
 
-| Resource                        | Monthly cost | Notes                                  |
-|---------------------------------|--------------|----------------------------------------|
-| PostgreSQL Flexible Server B1ms | ~$12.41      | Compute (pay-as-you-go)                |
-| PostgreSQL storage (32 GB)      | ~$5.28       | Premium SSD P4, minimum tier           |
-| PostgreSQL backup               | $0           | Free up to 100% of provisioned storage |
-| Functions Flex Consumption      | ~$0-5        | Free tier covers light usage           |
-| Container Apps (frontend)       | ~$0-3        | Free tier covers light usage           |
-| Storage Account (Durable state) | ~$0.01       | Negligible at MVP volume               |
-| Key Vault                       | ~$0.50       | Per-secret-operation pricing           |
-| Application Insights            | ~$0          | Free tier: 5 GB/month ingestion        |
-| **Total**                       | **~$18-26**  | PostgreSQL is the largest fixed cost   |
+| Resource                           | Monthly cost | Notes                                  |
+|------------------------------------|--------------|----------------------------------------|
+| PostgreSQL Flexible Server B1ms    | ~$12.41      | Compute (pay-as-you-go)                |
+| PostgreSQL storage (32 GB)         | ~$5.28       | Premium SSD P4, minimum tier           |
+| PostgreSQL backup                  | $0           | Free up to 100% of provisioned storage |
+| Functions Flex Consumption         | ~$0-5        | Free tier covers light usage           |
+| Container Apps (frontend)          | ~$0-3        | Free tier covers light usage           |
+| Storage Account (Durable state)    | ~$0.01       | Negligible at MVP volume               |
+| Key Vault                          | ~$0.50       | Per-secret-operation pricing           |
+| Azure OpenAI (GPT-5.4 Nano + mini) | ~$0-5        | Pay-per-token; light MVP usage         |
+| Foundry Hub + Project              | $0           | Free management layer                  |
+| Safety eval tokens (CI only)       | ~$0.01       | IndirectAttack + ContentSafety in CI   |
+| Application Insights               | ~$0          | Free tier: 5 GB/month ingestion        |
+| **Total**                          | **~$18-31**  | PostgreSQL is the largest fixed cost   |
 
 **Cost controls in Terraform:** Disable storage auto-grow (grows but never shrinks). Disable HA (doubles compute).
 Keep backup retention at 7 days.
@@ -731,12 +848,12 @@ stopped when not in use (~$5/month storage-only).
 
 ### DNS
 
-Domain: `bytehorizonforge.com` (managed in AWS Route 53).
+Domain: `<your-domain>` (managed in AWS Route 53).
 
-| Record                                 | Type  | Target                         |
-|----------------------------------------|-------|--------------------------------|
-| `omniwatcher.bytehorizonforge.com`     | CNAME | Container Apps FQDN (frontend) |
-| `api.omniwatcher.bytehorizonforge.com` | CNAME | Functions App default hostname |
+| Record                          | Type  | Target                         |
+|---------------------------------|-------|--------------------------------|
+| `omniwatcher.<your-domain>`     | CNAME | Container Apps FQDN (frontend) |
+| `api.omniwatcher.<your-domain>` | CNAME | Functions App default hostname |
 
 ### Local Development
 
@@ -767,7 +884,7 @@ docker compose up -d    # Starts: PostgreSQL, API server, Next.js dev server
 - All production traffic served over HTTPS. Container Apps and Functions provide managed TLS certificates.
 - Session cookie attributes: `HttpOnly`, `Secure` (production only), `SameSite=Lax`.
 - CORS: the Functions API is configured to accept requests only from
-  `https://omniwatcher.bytehorizonforge.com`.
+  `https://omniwatcher.<your-domain>`.
 
 ### Input Validation
 
@@ -875,6 +992,10 @@ These break silently if violated.
   random numbers, I/O, or non-deterministic APIs. Use `ctx.current_utc_datetime` for time. All non-deterministic
   work must happen in activity functions, not the orchestrator.
 
+- **One-shot schedules (`specific_date`) must auto-pause the watcher after the check completes.** The orchestration
+  must not call `continue_as_new` for expired one-shot schedules. Failure to pause creates an orchestration that
+  immediately re-evaluates, finds the date in the past, and enters a tight loop consuming unbounded compute.
+
 - **Webhook secrets are never returned in API responses.** The GET endpoint for webhook destinations omits the
   `secret` field. The secret is write-only from the client's perspective.
 
@@ -937,7 +1058,7 @@ content has not changed. Tavily was acquired by Nebius (Feb 2026) -- monitoring 
 ### AD-06: Better Auth Over Hand-Rolled or External Auth Providers
 
 **Decision:** Use Better Auth in the Next.js layer with PostgreSQL session storage.
-**Reasoning:** Proven pattern from the ai-roleplay project. Better Auth handles email/password, session
+**Reasoning:** Well-supported pattern for Next.js + PostgreSQL stacks. Better Auth handles email/password, session
 management, password reset, CSRF, and future OAuth out of the box with first-class PostgreSQL support. FastAPI
 validates sessions via a single `get_current_user` dependency that reads the cookie and queries the shared
 `sessions` table. This eliminates four hand-rolled auth endpoints, password hashing library dependencies, and
@@ -946,20 +1067,22 @@ Terraform support, Clerk moves data outside Azure, Auth.js is in maintenance mod
 
 ### AD-07: Pydantic Evals + Azure AI Evaluation for LLM Evaluations
 
-**Decision:** Use Pydantic Evals for task-specific CI evaluations and Azure AI Evaluation for quality/safety
-scoring.
+**Decision:** Use Pydantic Evals for task-specific CI evaluations, Azure AI Evaluation for quality/safety scoring,
+and Microsoft Foundry as the platform backing safety evaluators.
 **Reasoning:** Pydantic Evals is Python-native with typed datasets and Pydantic v2 models, integrating naturally
 with FastAPI schemas. Built-in statistical evaluators (precision-recall, confusion matrix, ROC-AUC) cover
 classification tasks. Azure AI Evaluation provides built-in quality evaluators (groundedness, coherence) and safety
-evaluators (indirect attack detection) that complement task-specific metrics. promptfoo was rejected due to
-acquisition by OpenAI (March 2026) creating long-term independence risk. Logfire (free tier, 10M spans/month)
-provides eval visualization. Microsoft Foundry (formerly Azure AI Foundry) was evaluated as a potential replacement
-for Logfire. Foundry tracing is GA only for prompt agents (preview for custom agent patterns like OmniWatcher's
-monitoring pipeline), and its eval capabilities require Azure connectivity for cloud evaluations. Logfire provides
-purpose-built Pydantic Evals visualization (experiment grids, side-by-side comparison, span-based evaluation) and
-richer LLM waterfall traces at zero cost on the free tier. The OTEL-native SDK with `send_to_logfire=False` fallback
-provides low lock-in. Foundry adoption will be re-evaluated when its tracing reaches GA for custom agent patterns or
-if it ships eval-specific dashboards comparable to Logfire.
+evaluators (indirect attack detection) that complement task-specific metrics. Standard quality evaluators
+(GroundednessEvaluator, CoherenceEvaluator) run against Azure OpenAI directly with no additional infrastructure.
+Safety evaluators (IndirectAttackEvaluator, ContentSafetyEvaluator) require a Microsoft Foundry project -- the
+Foundry Hub and Project are provisioned in Terraform for this purpose. Foundry itself is a free management layer;
+the only incremental cost is safety eval token usage (~$0.02/$0.06 per 1K tokens), which is negligible for CI-only
+eval runs on small datasets. promptfoo was rejected due to acquisition by OpenAI (March 2026) creating long-term
+independence risk. Logfire (free tier, 10M spans/month) provides eval visualization with purpose-built Pydantic
+Evals support (experiment grids, side-by-side comparison, span-based evaluation) and LLM waterfall traces at zero
+cost. The OTEL-native SDK with `send_to_logfire=False` fallback provides low lock-in. Foundry tracing is not
+adopted for observability -- it is GA only for prompt agents (preview for custom agent patterns like OmniWatcher's
+monitoring pipeline) and does not yet offer eval-specific dashboards comparable to Logfire.
 
 ### AD-08: Unified Webhook Delivery Engine
 

@@ -101,7 +101,7 @@ that the user never falls back to doing the work manually.
 
 - **Cloud:** Azure (personal subscription)
 - **Environments:** Non-production and production within the same subscription
-- **Domain:** bytehorizonforge.com (likely a subdomain), DNS managed in AWS Route 53 with the application running in
+- **Domain:** <your-domain> (likely a subdomain), DNS managed in AWS Route 53 with the application running in
   Azure
 - **Compute model:** Scale-to-zero (Azure Functions, Container Apps)
 - **IaC:** Terraform/OpenTofu -- avoid manual portal-driven setup
