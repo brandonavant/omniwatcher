@@ -1,0 +1,1473 @@
+# OmniWatcher API Contract
+#
+# This is the authoritative specification for all API endpoints. Both backend and
+# frontend implement against this file. Neither modifies it unilaterally.
+#
+# Auth endpoints (/api/auth/*) are handled by Better Auth in the Next.js layer
+# and are not part of this contract.
+
+openapi: "3.1.0"
+
+info:
+  title: OmniWatcher API
+  version: "0.1.0"
+  description: |
+    API contract for OmniWatcher, a web-based monitoring tool that watches the web for
+    information changes that matter to a specific user. All endpoints require session
+    cookie authentication unless marked otherwise.
+
+    **Rate limiting:** All authenticated endpoints are rate-limited to 60 requests per
+    minute per user. Exceeding the limit returns HTTP 429 with a `Retry-After` header.
+
+    **Error format:** All error responses use `{ "detail": "Human-readable message" }`.
+
+    **Conventions:**
+    - IDs are UUID v4, generated server-side.
+    - Timestamps are ISO 8601, UTC.
+    - Pagination uses `limit` and `offset` query parameters; responses include `total`.
+
+servers:
+  - url: http://localhost:8000
+    description: Local development (FastAPI backend)
+  - url: http://localhost:4010
+    description: Mock server (Prism)
+
+tags:
+  - name: System
+    description: Health and status endpoints
+  - name: Onboarding
+    description: Watcher creation onboarding pipeline (prompt parsing, source discovery, quality assessment)
+  - name: Watchers
+    description: Watcher CRUD and lifecycle management
+  - name: Alerts
+    description: Alert history for watchers
+  - name: Webhooks
+    description: Webhook destination management and testing
+  - name: User
+    description: User profile management
+
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+
+paths:
+
+  # --- System ---
+
+  /api/health:
+    get:
+      operationId: getHealth
+      tags: [System]
+      summary: Health check
+      description: Returns service status. No authentication required.
+      responses:
+        "200":
+          description: Service is healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, version]
+                properties:
+                  status:
+                    type: string
+                    enum: [ok]
+                    example: ok
+                  version:
+                    type: string
+                    example: "0.1.0"
+
+  # --- Onboarding ---
+
+  /api/watchers/onboard:
+    post:
+      operationId: startOnboarding
+      tags: [Onboarding]
+      summary: Start the watcher onboarding orchestration
+      description: |
+        Submits a natural-language watcher description to the onboarding pipeline. Starts
+        a Durable Functions orchestration that runs three activity functions in sequence:
+        prompt parsing, source discovery, and source quality assessment. Returns an
+        instance ID for polling progress via the status endpoint.
+
+        The description is validated (1--2000 characters, HTML tags stripped server-side)
+        before the orchestration starts.
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/OnboardingRequest"
+      responses:
+        "202":
+          description: Onboarding orchestration started
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OnboardingStarted"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+
+  /api/watchers/onboard/{instanceId}/status:
+    get:
+      operationId: getOnboardingStatus
+      tags: [Onboarding]
+      summary: Poll onboarding orchestration progress
+      description: |
+        Returns the current status of an onboarding orchestration. The frontend polls
+        this endpoint at 1.5-second intervals while `runtimeStatus` is `Pending` or
+        `Running`.
+
+        The `customStatus.step` field drives progressive UI updates (button label changes
+        in the watcher creation flow). The `output` field is populated only when
+        `runtimeStatus` is `Completed` and the final step is `assessed`.
+
+        Returns 404 if the instance does not exist or belongs to a different user
+        (ownership validated against the orchestration input's user ID).
+      security:
+        - sessionCookie: []
+      parameters:
+        - name: instanceId
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Durable Functions orchestration instance ID returned by the start endpoint.
+      responses:
+        "200":
+          description: Current orchestration status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OnboardingStatus"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  # --- Watchers ---
+
+  /api/watchers:
+    get:
+      operationId: listWatchers
+      tags: [Watchers]
+      summary: List the authenticated user's watchers
+      description: |
+        Returns all non-deleted watchers for the authenticated user, sorted by status
+        (active first, paused second), then by `nextCheckAt` ascending within each group.
+        Sort order is server-determined; no client-side sort parameters.
+      security:
+        - sessionCookie: []
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 50
+            minimum: 1
+            maximum: 100
+          description: Maximum number of watchers to return.
+        - name: offset
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 0
+            minimum: 0
+          description: Number of watchers to skip for pagination.
+      responses:
+        "200":
+          description: List of watchers
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, total]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Watcher"
+                  total:
+                    type: integer
+                    description: Total number of non-deleted watchers for the user.
+                    example: 5
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+    post:
+      operationId: createWatcher
+      tags: [Watchers]
+      summary: Create a watcher from confirmed onboarding results
+      description: |
+        Creates a watcher with the configuration confirmed by the user during the
+        onboarding review step (UX spec Step 2). The watcher is created with
+        `status = "active"` and `nextCheckAt` set to the first scheduled check time.
+        The system signals the watcher's Durable Entity to activate the monitoring
+        orchestration.
+
+        **Precondition:** The user must have at least one webhook destination configured.
+        Returns 409 if no destinations exist.
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/WatcherCreate"
+      responses:
+        "201":
+          description: Watcher created and activated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Watcher"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          description: |
+            No webhook destinations configured. The user must add at least one
+            webhook destination before creating a watcher (F-04 AC-03).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+
+  /api/watchers/{watcherId}:
+    get:
+      operationId: getWatcher
+      tags: [Watchers]
+      summary: Get a single watcher
+      description: |
+        Returns the watcher's full configuration and status. Returns 404 if the watcher
+        does not exist, is soft-deleted, or belongs to a different user.
+      security:
+        - sessionCookie: []
+      parameters:
+        - $ref: "#/components/parameters/WatcherId"
+      responses:
+        "200":
+          description: Watcher details
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Watcher"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+    patch:
+      operationId: updateWatcher
+      tags: [Watchers]
+      summary: Update a watcher's configuration
+      description: |
+        Updates the watcher's editable fields: change triggers, schedule, and sources.
+        Description and parsed topic are not editable after creation. Only include the
+        fields to change (JSON Merge Patch semantics). Array fields (`changeTriggers`,
+        `sources`) replace the entire array when present.
+
+        If the schedule is changed and the watcher is active, the monitoring orchestration
+        is restarted automatically (the Durable Entity terminates the current orchestration
+        and starts a new one).
+      security:
+        - sessionCookie: []
+      parameters:
+        - $ref: "#/components/parameters/WatcherId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/WatcherUpdate"
+      responses:
+        "200":
+          description: Watcher updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Watcher"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+
+    delete:
+      operationId: deleteWatcher
+      tags: [Watchers]
+      summary: Soft-delete a watcher
+      description: |
+        Sets the watcher's status to `deleted` and records the deletion timestamp. The
+        monitoring orchestration is terminated via the Durable Entity. The watcher is
+        excluded from all default queries. Hard-deleted after 30 days by a scheduled
+        cleanup job.
+      security:
+        - sessionCookie: []
+      parameters:
+        - $ref: "#/components/parameters/WatcherId"
+      responses:
+        "204":
+          description: Watcher deleted
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/watchers/{watcherId}/pause:
+    post:
+      operationId: pauseWatcher
+      tags: [Watchers]
+      summary: Pause a watcher
+      description: |
+        Pauses the watcher's scheduled checks by terminating the monitoring orchestration.
+        The watcher remains visible in the user's list with `status = "paused"` and
+        `nextCheckAt = null`.
+      security:
+        - sessionCookie: []
+      parameters:
+        - $ref: "#/components/parameters/WatcherId"
+      responses:
+        "200":
+          description: Watcher paused. Returns the updated watcher.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Watcher"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Watcher is already paused.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /api/watchers/{watcherId}/resume:
+    post:
+      operationId: resumeWatcher
+      tags: [Watchers]
+      summary: Resume a paused watcher
+      description: |
+        Resumes the watcher's scheduled checks by starting a new monitoring orchestration.
+        The next check time is recalculated based on the watcher's schedule and returned
+        in the response.
+      security:
+        - sessionCookie: []
+      parameters:
+        - $ref: "#/components/parameters/WatcherId"
+      responses:
+        "200":
+          description: Watcher resumed. Returns the updated watcher with recalculated `nextCheckAt`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Watcher"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Watcher is already active.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  # --- Alerts ---
+
+  /api/alerts:
+    get:
+      operationId: listAlerts
+      tags: [Alerts]
+      summary: List alerts for a watcher
+      description: |
+        Returns alerts for a specific watcher, ordered by creation date descending
+        (most recent first). The watcher must belong to the authenticated user.
+      security:
+        - sessionCookie: []
+      parameters:
+        - name: watcherId
+          in: query
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: The watcher to list alerts for. Must belong to the authenticated user.
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 20
+            minimum: 1
+            maximum: 100
+          description: Maximum number of alerts to return.
+        - name: offset
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 0
+            minimum: 0
+          description: Number of alerts to skip for pagination.
+      responses:
+        "200":
+          description: Paginated list of alerts
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, total]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Alert"
+                  total:
+                    type: integer
+                    description: Total number of alerts for this watcher.
+                    example: 42
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: Watcher not found or does not belong to the authenticated user.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  # --- Webhooks ---
+
+  /api/webhooks:
+    get:
+      operationId: listWebhookDestinations
+      tags: [Webhooks]
+      summary: List the authenticated user's webhook destinations
+      security:
+        - sessionCookie: []
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 50
+            minimum: 1
+            maximum: 100
+          description: Maximum number of destinations to return.
+        - name: offset
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 0
+            minimum: 0
+          description: Number of destinations to skip for pagination.
+      responses:
+        "200":
+          description: List of webhook destinations
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, total]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/WebhookDestination"
+                  total:
+                    type: integer
+                    description: Total number of webhook destinations for the user.
+                    example: 2
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+    post:
+      operationId: createWebhookDestination
+      tags: [Webhooks]
+      summary: Create a webhook destination
+      description: |
+        Creates a new webhook destination. For `generic` type destinations, a signing
+        secret is generated server-side and included in the response. **The secret is
+        shown only once and cannot be retrieved later.**
+
+        If `isDefault` is set to `true`, any existing default destination is demoted.
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/WebhookDestinationCreate"
+      responses:
+        "201":
+          description: |
+            Webhook destination created. For `generic` type, the `secret` field contains
+            the HMAC-SHA256 signing key (shown once).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WebhookDestinationWithSecret"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+
+  /api/webhooks/{webhookId}:
+    get:
+      operationId: getWebhookDestination
+      tags: [Webhooks]
+      summary: Get a single webhook destination
+      description: Returns the destination's configuration. The signing secret is never included.
+      security:
+        - sessionCookie: []
+      parameters:
+        - $ref: "#/components/parameters/WebhookId"
+      responses:
+        "200":
+          description: Webhook destination details
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WebhookDestination"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+    patch:
+      operationId: updateWebhookDestination
+      tags: [Webhooks]
+      summary: Update a webhook destination
+      description: |
+        Updates the destination's name, URL, or default status. The `type` cannot be
+        changed after creation. Only include the fields to change. If `isDefault` is set
+        to `true`, any existing default destination is demoted.
+      security:
+        - sessionCookie: []
+      parameters:
+        - $ref: "#/components/parameters/WebhookId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/WebhookDestinationUpdate"
+      responses:
+        "200":
+          description: Webhook destination updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WebhookDestination"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+
+    delete:
+      operationId: deleteWebhookDestination
+      tags: [Webhooks]
+      summary: Delete a webhook destination
+      description: |
+        Permanently deletes the webhook destination. Watchers will no longer deliver
+        alerts to it.
+      security:
+        - sessionCookie: []
+      parameters:
+        - $ref: "#/components/parameters/WebhookId"
+      responses:
+        "204":
+          description: Webhook destination deleted
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/webhooks/{webhookId}/test:
+    post:
+      operationId: testWebhookDestination
+      tags: [Webhooks]
+      summary: Send a test delivery to a webhook destination
+      description: |
+        Sends a test alert payload to the destination using the same delivery engine and
+        format adapters as real alert delivery. Returns the delivery result regardless of
+        whether the destination accepted or rejected the payload.
+      security:
+        - sessionCookie: []
+      parameters:
+        - $ref: "#/components/parameters/WebhookId"
+      responses:
+        "200":
+          description: |
+            Test delivery attempted. Check `success` for the result. A `200` from this
+            endpoint means the test was performed, not that the destination accepted it.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WebhookTestResult"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  # --- User ---
+
+  /api/users/me:
+    get:
+      operationId: getCurrentUser
+      tags: [User]
+      summary: Get the authenticated user's profile
+      description: |
+        Returns profile information for the authenticated user. Name and email are read
+        from the Better Auth `users` table. Timezone is managed by the API.
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: User profile
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UserProfile"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+    patch:
+      operationId: updateCurrentUser
+      tags: [User]
+      summary: Update the authenticated user's profile
+      description: |
+        Updates profile settings managed by the API. Currently limited to timezone.
+        Name and password changes are handled by Better Auth in the Next.js layer.
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UserProfileUpdate"
+      responses:
+        "200":
+          description: Profile updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UserProfile"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+
+    delete:
+      operationId: deleteCurrentUser
+      tags: [User]
+      summary: Delete the authenticated user's account
+      description: |
+        Permanently deletes the user's account and all associated data: watchers (and
+        their monitoring orchestrations), alerts, webhook destinations, and the Better
+        Auth user record. The session is invalidated. This action cannot be undone.
+      security:
+        - sessionCookie: []
+      responses:
+        "204":
+          description: Account and all associated data deleted
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+# ---------------------------------------------------------------------------
+# Components
+# ---------------------------------------------------------------------------
+
+components:
+
+  # --- Schemas ---
+
+  schemas:
+
+    # -- Errors --
+
+    Error:
+      type: object
+      required: [detail]
+      properties:
+        detail:
+          type: string
+          example: "Not found"
+
+    # -- Onboarding --
+
+    OnboardingRequest:
+      type: object
+      required: [description]
+      properties:
+        description:
+          type: string
+          minLength: 1
+          maxLength: 2000
+          description: |
+            Natural-language description of what the user wants to track. HTML tags are
+            stripped server-side before processing.
+          example: >-
+            Track the Silent Hill 1 Remake for me. Check daily at 09:00 and let me know
+            about new trailers, newly-announced dates, delays, and release arrivals.
+
+    OnboardingStarted:
+      type: object
+      required: [instanceId]
+      properties:
+        instanceId:
+          type: string
+          description: Durable Functions orchestration instance ID. Use to poll for progress.
+          example: "d4e5f6a7-b8c9-0123-d456-e7f8a9b0c1d2"
+
+    OnboardingStatus:
+      type: object
+      required: [runtimeStatus]
+      properties:
+        runtimeStatus:
+          type: string
+          enum: [Pending, Running, Completed, Failed, Terminated]
+          description: The Durable Functions orchestration runtime status.
+        customStatus:
+          description: |
+            Current pipeline step and accumulated data. Null when `runtimeStatus` is
+            `Pending` and no step has started yet.
+          oneOf:
+            - type: "null"
+            - $ref: "#/components/schemas/OnboardingCustomStatus"
+        output:
+          description: |
+            Final onboarding result. Present only when `runtimeStatus` is `Completed` and
+            the final step is `assessed`. Null in all other cases, including when the
+            orchestration completes with `clarification_needed` (use
+            `customStatus.data.questions` instead).
+          oneOf:
+            - type: "null"
+            - $ref: "#/components/schemas/OnboardingResult"
+
+    OnboardingCustomStatus:
+      description: |
+        Discriminated union of pipeline steps. The `step` field determines the shape
+        of `data`.
+      oneOf:
+        - $ref: "#/components/schemas/OnboardingStepParsing"
+        - $ref: "#/components/schemas/OnboardingStepParsed"
+        - $ref: "#/components/schemas/OnboardingStepDiscovering"
+        - $ref: "#/components/schemas/OnboardingStepDiscovered"
+        - $ref: "#/components/schemas/OnboardingStepAssessing"
+        - $ref: "#/components/schemas/OnboardingStepAssessed"
+        - $ref: "#/components/schemas/OnboardingStepClarificationNeeded"
+      discriminator:
+        propertyName: step
+        mapping:
+          parsing: "#/components/schemas/OnboardingStepParsing"
+          parsed: "#/components/schemas/OnboardingStepParsed"
+          discovering: "#/components/schemas/OnboardingStepDiscovering"
+          discovered: "#/components/schemas/OnboardingStepDiscovered"
+          assessing: "#/components/schemas/OnboardingStepAssessing"
+          assessed: "#/components/schemas/OnboardingStepAssessed"
+          clarification_needed: "#/components/schemas/OnboardingStepClarificationNeeded"
+
+    OnboardingStepParsing:
+      type: object
+      required: [step]
+      description: System is parsing the user's description to extract topic, change triggers, and schedule.
+      properties:
+        step:
+          type: string
+          const: parsing
+        data:
+          type: "null"
+
+    OnboardingStepParsed:
+      type: object
+      required: [step, data]
+      description: Parsing complete. Contains extracted topic, change triggers, and schedule.
+      properties:
+        step:
+          type: string
+          const: parsed
+        data:
+          type: object
+          required: [topic, changeTriggers, schedule]
+          properties:
+            topic:
+              type: string
+              example: "Silent Hill 1 Remake"
+            changeTriggers:
+              type: array
+              items:
+                type: string
+              example: ["new trailers", "release date changes", "delays", "release arrivals"]
+            schedule:
+              $ref: "#/components/schemas/Schedule"
+
+    OnboardingStepDiscovering:
+      type: object
+      required: [step]
+      description: System is searching the web for relevant sources.
+      properties:
+        step:
+          type: string
+          const: discovering
+        data:
+          type: "null"
+
+    OnboardingStepDiscovered:
+      type: object
+      required: [step, data]
+      description: Source discovery complete. Sources do not yet have trust level assessments.
+      properties:
+        step:
+          type: string
+          const: discovered
+        data:
+          type: object
+          required: [sources]
+          properties:
+            sources:
+              type: array
+              items:
+                $ref: "#/components/schemas/DiscoveredSource"
+
+    OnboardingStepAssessing:
+      type: object
+      required: [step]
+      description: System is evaluating each source's relevance and trustworthiness.
+      properties:
+        step:
+          type: string
+          const: assessing
+        data:
+          type: "null"
+
+    OnboardingStepAssessed:
+      type: object
+      required: [step, data]
+      description: Quality assessment complete. Sources now include trust levels. Low-quality sources have been filtered out.
+      properties:
+        step:
+          type: string
+          const: assessed
+        data:
+          type: object
+          required: [sources]
+          properties:
+            sources:
+              type: array
+              items:
+                $ref: "#/components/schemas/Source"
+
+    OnboardingStepClarificationNeeded:
+      type: object
+      required: [step, data]
+      description: |
+        The description is ambiguous or incomplete. The user must revise their description
+        to address the listed questions and resubmit via a new onboarding request.
+      properties:
+        step:
+          type: string
+          const: clarification_needed
+        data:
+          type: object
+          required: [questions]
+          properties:
+            questions:
+              type: array
+              items:
+                type: string
+              example:
+                - "What specific aspects of this topic are you most interested in tracking?"
+                - "Are there particular sources you trust for this information?"
+
+    OnboardingResult:
+      type: object
+      required: [topic, changeTriggers, schedule, sources]
+      description: |
+        The final onboarding result containing the parsed configuration and assessed
+        sources. Returned as the orchestration output when the pipeline completes
+        successfully (final step is `assessed`).
+      properties:
+        topic:
+          type: string
+          example: "Silent Hill 1 Remake"
+        changeTriggers:
+          type: array
+          items:
+            type: string
+          example: ["new trailers", "release date changes", "delays"]
+        schedule:
+          $ref: "#/components/schemas/Schedule"
+        sources:
+          type: array
+          items:
+            $ref: "#/components/schemas/Source"
+
+    # -- Sources --
+
+    DiscoveredSource:
+      type: object
+      description: A source discovered during onboarding, before quality assessment.
+      required: [id, type, value, label]
+      properties:
+        id:
+          type: string
+          format: uuid
+          example: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+        type:
+          $ref: "#/components/schemas/SourceType"
+        value:
+          type: string
+          description: The URL (for `url` type) or search query string (for `search` type).
+          example: "https://www.konami.com/games/silenthill"
+        label:
+          type: string
+          description: User-facing display name.
+          example: "Konami Silent Hill Official Page"
+
+    Source:
+      type: object
+      description: A source with quality assessment. Used in watcher configuration and assessed onboarding results.
+      required: [id, type, value, label, trustLevel]
+      properties:
+        id:
+          type: string
+          format: uuid
+          example: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+        type:
+          $ref: "#/components/schemas/SourceType"
+        value:
+          type: string
+          example: "https://www.konami.com/games/silenthill"
+        label:
+          type: string
+          example: "Konami Silent Hill Official Page"
+        trustLevel:
+          $ref: "#/components/schemas/TrustLevel"
+
+    SourceInput:
+      type: object
+      description: |
+        A source provided in watcher create or update requests. Include `trustLevel` for
+        sources carried over from onboarding results. Omit for user-added sources; the
+        server defaults to `medium`.
+      required: [type, value, label]
+      properties:
+        type:
+          $ref: "#/components/schemas/SourceType"
+        value:
+          type: string
+          description: HTTPS URL (for `url` type) or search query string (for `search` type). URL sources must be HTTPS.
+        label:
+          type: string
+          description: User-facing display name.
+        trustLevel:
+          $ref: "#/components/schemas/TrustLevel"
+
+    SourceType:
+      type: string
+      enum: [url, search]
+      description: |
+        `url` -- a specific page re-fetched on each check.
+        `search` -- a query run via Tavily on each check to discover new content.
+
+    TrustLevel:
+      type: string
+      enum: [high, medium, low]
+      description: System-assigned source quality assessment.
+
+    # -- Schedule (discriminated union) --
+
+    Schedule:
+      description: |
+        Watcher schedule configuration. Discriminated union on the `type` field.
+      oneOf:
+        - $ref: "#/components/schemas/FrequencySchedule"
+        - $ref: "#/components/schemas/DaysOfWeekSchedule"
+        - $ref: "#/components/schemas/SpecificDateSchedule"
+      discriminator:
+        propertyName: type
+        mapping:
+          frequency: "#/components/schemas/FrequencySchedule"
+          days_of_week: "#/components/schemas/DaysOfWeekSchedule"
+          specific_date: "#/components/schemas/SpecificDateSchedule"
+
+    FrequencySchedule:
+      type: object
+      description: |
+        Interval-based checks anchored to a preferred time. Checks fire every
+        `frequencyHours` hours. For sub-daily frequencies, checks are spaced evenly
+        from the preferred time (e.g., `frequencyHours: 6` with `preferredTime: "09:00"`
+        yields 09:00, 15:00, 21:00, 03:00).
+      required: [type, frequencyHours, preferredTime, timezone]
+      properties:
+        type:
+          type: string
+          const: frequency
+        frequencyHours:
+          type: integer
+          minimum: 1
+          maximum: 168
+          description: Check interval in hours. Minimum 1 (hourly), maximum 168 (weekly).
+          example: 24
+        preferredTime:
+          type: string
+          pattern: "^([01]\\d|2[0-3]):[0-5]\\d$"
+          description: Anchor time in HH:MM 24-hour format.
+          example: "09:00"
+        timezone:
+          type: string
+          description: IANA timezone identifier.
+          example: "America/Chicago"
+
+    DaysOfWeekSchedule:
+      type: object
+      description: Checks on specific weekdays at explicit times.
+      required: [type, days, times, timezone]
+      properties:
+        type:
+          type: string
+          const: days_of_week
+        days:
+          type: array
+          items:
+            type: integer
+            minimum: 1
+            maximum: 7
+          minItems: 1
+          maxItems: 7
+          uniqueItems: true
+          description: ISO 8601 weekdays (1=Monday through 7=Sunday). Sorted ascending, no duplicates.
+          example: [1, 3, 5]
+        times:
+          type: array
+          items:
+            type: string
+            pattern: "^([01]\\d|2[0-3]):[0-5]\\d$"
+          minItems: 1
+          maxItems: 6
+          uniqueItems: true
+          description: |
+            Check times in HH:MM 24-hour format. Sorted ascending, no duplicates.
+            Consecutive entries must differ by at least 60 minutes (N-03).
+          example: ["09:00"]
+        timezone:
+          type: string
+          description: IANA timezone identifier.
+          example: "America/Chicago"
+
+    SpecificDateSchedule:
+      type: object
+      description: |
+        One-shot check on a single date. After the check completes, the watcher
+        transitions to `paused`.
+      required: [type, date, time, timezone]
+      properties:
+        type:
+          type: string
+          const: specific_date
+        date:
+          type: string
+          format: date
+          description: Target date in YYYY-MM-DD format. Must be in the future at creation time.
+          example: "2026-04-15"
+        time:
+          type: string
+          pattern: "^([01]\\d|2[0-3]):[0-5]\\d$"
+          description: Target time in HH:MM 24-hour format.
+          example: "09:00"
+        timezone:
+          type: string
+          description: IANA timezone identifier.
+          example: "America/Chicago"
+
+    # -- Watchers --
+
+    Watcher:
+      type: object
+      required:
+        - id
+        - description
+        - parsedTopic
+        - changeTriggers
+        - sources
+        - schedule
+        - status
+        - nextCheckAt
+        - lastCheckAt
+        - createdAt
+        - updatedAt
+      properties:
+        id:
+          type: string
+          format: uuid
+          example: "550e8400-e29b-41d4-a716-446655440000"
+        description:
+          type: string
+          maxLength: 2000
+          example: "Track the Silent Hill 1 Remake for me. Check daily at 09:00..."
+        parsedTopic:
+          type: string
+          maxLength: 500
+          description: The topic extracted during onboarding. Not editable after creation.
+          example: "Silent Hill 1 Remake"
+        changeTriggers:
+          type: array
+          items:
+            type: string
+          minItems: 1
+          example: ["new trailers", "release date changes", "delays"]
+        sources:
+          type: array
+          items:
+            $ref: "#/components/schemas/Source"
+          minItems: 1
+          maxItems: 10
+        schedule:
+          $ref: "#/components/schemas/Schedule"
+        status:
+          type: string
+          enum: [active, paused]
+          description: Watcher status. Soft-deleted watchers are excluded from API responses.
+        nextCheckAt:
+          type: ["string", "null"]
+          format: date-time
+          description: Next scheduled check time (UTC). Null when status is `paused`.
+        lastCheckAt:
+          type: ["string", "null"]
+          format: date-time
+          description: Last completed check time (UTC). Null if no checks have run yet.
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+
+    WatcherCreate:
+      type: object
+      required: [description, parsedTopic, changeTriggers, sources, schedule]
+      properties:
+        description:
+          type: string
+          minLength: 1
+          maxLength: 2000
+          description: The user's original natural-language description.
+        parsedTopic:
+          type: string
+          minLength: 1
+          maxLength: 500
+          description: The topic extracted during onboarding.
+        changeTriggers:
+          type: array
+          items:
+            type: string
+          minItems: 1
+          description: At least one change trigger is required.
+        sources:
+          type: array
+          items:
+            $ref: "#/components/schemas/SourceInput"
+          minItems: 1
+          maxItems: 10
+          description: |
+            1 to 10 sources. Include `trustLevel` for sources from onboarding results;
+            omit for user-added sources (server defaults to `medium`).
+        schedule:
+          $ref: "#/components/schemas/Schedule"
+
+    WatcherUpdate:
+      type: object
+      description: |
+        Partial update for a watcher. Include only the fields to change. Description
+        and parsed topic are not editable after creation.
+      properties:
+        changeTriggers:
+          type: array
+          items:
+            type: string
+          minItems: 1
+        sources:
+          type: array
+          items:
+            $ref: "#/components/schemas/SourceInput"
+          minItems: 1
+          maxItems: 10
+        schedule:
+          $ref: "#/components/schemas/Schedule"
+
+    # -- Alerts --
+
+    Alert:
+      type: object
+      required: [id, watcherId, title, summary, sourceUrls, delivered, createdAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+          example: "660e8400-e29b-41d4-a716-446655440000"
+        watcherId:
+          type: string
+          format: uuid
+        title:
+          type: string
+          maxLength: 200
+          example: "New Silent Hill 1 Remake trailer released"
+        summary:
+          type: string
+          maxLength: 1500
+          description: Markdown-formatted summary of what changed and why it matters.
+          example: "Konami released a new gameplay trailer for the Silent Hill 1 Remake showing updated combat mechanics and environmental puzzles..."
+        sourceUrls:
+          type: array
+          items:
+            type: string
+            format: uri
+          description: Direct links to the sources where the change was detected.
+          example: ["https://www.konami.com/games/silenthill/news/trailer-3"]
+        delivered:
+          type: boolean
+          description: Whether the alert was successfully delivered to at least one webhook destination.
+        createdAt:
+          type: string
+          format: date-time
+
+    # -- Webhooks --
+
+    WebhookDestination:
+      type: object
+      description: Webhook destination configuration. The signing secret is never included in read responses.
+      required: [id, name, type, url, isDefault, createdAt, updatedAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+          example: "770e8400-e29b-41d4-a716-446655440000"
+        name:
+          type: string
+          maxLength: 100
+          example: "My Discord Server"
+        type:
+          type: string
+          enum: [generic, discord]
+        url:
+          type: string
+          format: uri
+          description: The HTTPS endpoint URL.
+          example: "https://discord.com/api/webhooks/123456789/abcdef"
+        isDefault:
+          type: boolean
+          description: Whether this is the user's default webhook destination.
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+
+    WebhookDestinationWithSecret:
+      description: |
+        Webhook destination returned on creation. For `generic` type destinations,
+        includes the HMAC-SHA256 signing `secret`. The secret is shown only once and
+        cannot be retrieved later.
+      allOf:
+        - $ref: "#/components/schemas/WebhookDestination"
+        - type: object
+          properties:
+            secret:
+              type: ["string", "null"]
+              description: |
+                HMAC-SHA256 signing secret for `generic` type destinations. Null for
+                `discord` type (Discord embeds authentication in the webhook URL).
+                **Shown only once at creation time.**
+              example: "whsec_a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6"
+
+    WebhookDestinationCreate:
+      type: object
+      required: [name, type, url]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+        type:
+          type: string
+          enum: [generic, discord]
+        url:
+          type: string
+          format: uri
+          description: |
+            HTTPS URL. For `generic`: the endpoint that will receive POST requests.
+            For `discord`: the full Discord webhook URL
+            (`https://discord.com/api/webhooks/{id}/{token}`).
+        isDefault:
+          type: boolean
+          default: false
+          description: Set as the default destination. Demotes any existing default.
+
+    WebhookDestinationUpdate:
+      type: object
+      description: |
+        Partial update for a webhook destination. Include only the fields to change.
+        The `type` cannot be changed after creation.
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+        url:
+          type: string
+          format: uri
+          description: HTTPS URL.
+        isDefault:
+          type: boolean
+          description: Set as the default destination. Demotes any existing default.
+
+    WebhookTestResult:
+      type: object
+      required: [success]
+      properties:
+        success:
+          type: boolean
+          description: Whether the test delivery was accepted by the destination.
+        statusCode:
+          type: ["integer", "null"]
+          description: HTTP status code returned by the destination. Null if the request failed before receiving a response (e.g., DNS resolution failure, connection refused).
+          example: 204
+        error:
+          type: ["string", "null"]
+          description: Error message if the delivery failed. Null on success.
+          example: null
+
+    # -- User --
+
+    UserProfile:
+      type: object
+      required: [id, name, email, timezone, createdAt]
+      properties:
+        id:
+          type: string
+          description: Better Auth user ID.
+          example: "user_abc123def456"
+        name:
+          type: string
+          example: "Brandon Avant"
+        email:
+          type: string
+          format: email
+          example: "user@example.com"
+        timezone:
+          type: string
+          description: IANA timezone identifier. Used for schedule display defaults and new watcher schedule defaults. Defaults to `UTC` if not set.
+          example: "America/Chicago"
+        createdAt:
+          type: string
+          format: date-time
+
+    UserProfileUpdate:
+      type: object
+      description: |
+        Profile fields managed by the API. Name and password changes are handled by
+        Better Auth in the Next.js layer.
+      properties:
+        timezone:
+          type: string
+          description: IANA timezone identifier.
+          example: "America/Chicago"
+
+  # --- Parameters ---
+
+  parameters:
+    WatcherId:
+      name: watcherId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+      description: The watcher's unique identifier.
+
+    WebhookId:
+      name: webhookId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+      description: The webhook destination's unique identifier.
+
+  # --- Security Schemes ---
+
+  securitySchemes:
+    sessionCookie:
+      type: apiKey
+      in: cookie
+      name: better-auth.session_token
+      description: |
+        Session cookie set by Better Auth after login. In production (HTTPS), the cookie
+        name is `__Secure-better-auth.session_token`. The FastAPI backend validates this
+        cookie against the `sessions` table via the `get_current_user` dependency.
+
+  # --- Reusable Responses ---
+
+  responses:
+    Unauthorized:
+      description: Authentication required. Session cookie is missing, invalid, or expired.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            detail: "Not authenticated"
+
+    NotFound:
+      description: The requested resource does not exist or does not belong to the authenticated user.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            detail: "Not found"
+
+    ValidationError:
+      description: Request body or parameters failed validation.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            detail: "Description must be between 1 and 2000 characters"
+
+    RateLimited:
+      description: Rate limit exceeded (60 requests per minute per user).
+      headers:
+        Retry-After:
+          schema:
+            type: integer
+          description: Seconds to wait before retrying.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            detail: "Rate limit exceeded"
