@@ -2,12 +2,12 @@
 
 ## Document Header
 
-| Field          | Value                                                                    |
-|----------------|--------------------------------------------------------------------------|
-| Version        | v2.1                                                                     |
-| Date           | 2026-03-29                                                               |
-| Author         | Brandon Avant                                                            |
-| Change Summary | Add Microsoft Foundry + Azure OpenAI resource to deployment architecture |
+| Field          | Value                                                                              |
+|----------------|------------------------------------------------------------------------------------|
+| Version        | v2.2                                                                               |
+| Date           | 2026-03-30                                                                         |
+| Author         | Brandon Avant                                                                      |
+| Change Summary | Add Durable Functions onboarding orchestration with polling-based progress (AD-11) |
 
 ---
 
@@ -385,30 +385,131 @@ Addresses N-11 (LLM security and prompt injection mitigation). Defense-in-depth 
 
 ## 5. Watcher Onboarding Flow
 
-When a user creates a watcher, the system performs a multi-step onboarding before the watcher goes live.
+When a user creates a watcher, the system performs a multistep onboarding pipeline before the watcher goes live. The
+pipeline runs as a **Durable Functions orchestration** so the frontend can poll for progress and display progressive
+status updates as each step completes.
 
-1. **Prompt parsing (LLM -- GPT-5.4 Nano):** Extract topic, change triggers, and requested schedule from the user's
-   natural-language description. The schedule is produced as one of the three discriminated-union types (`frequency`,
-   `days_of_week`, or `specific_date`); if no schedule is mentioned, the LLM defaults to
-   `{"type": "frequency", "frequencyHours": 24, "preferredTime": "09:00"}` using the user's profile timezone. If the
-   description is ambiguous or incomplete (no clear topic, no identifiable change triggers), return clarification
-   questions instead of proceeding.
+### 5.1 Onboarding Orchestration
 
-2. **Source discovery (Tavily):** Run targeted web searches based on the extracted topic. Discover relevant,
-   authoritative sources (official sites, publisher pages, prominent community hubs).
+A `POST /api/watchers/onboard` request starts a short-lived Durable Functions orchestration that runs three activity
+functions in sequence. The orchestration calls `ctx.set_custom_status()` before and after each activity so the frontend
+can poll for the current step and accumulated results.
 
-3. **Source quality assessment (LLM -- GPT-5.4 Nano):** Evaluate each discovered source for relevance to the topic
-   and likely authority. Assign a trust level (`high`, `medium`, `low`). Filter out low-quality results.
+If the first activity (prompt parsing) determines the description is ambiguous, the orchestration completes early with
+a `clarification_needed` custom status. Otherwise, it runs all three activities and completes with the full result.
 
-4. **User confirmation:** Present the parsed watcher configuration (topic, triggers, schedule) and the discovered
-   source list to the user. The schedule is rendered type-specifically: `frequency` as "Every N hours at HH:MM TZ",
-   `days_of_week` as "Mon, Wed, Fri at HH:MM TZ", `specific_date` as "Once on YYYY-MM-DD at HH:MM TZ". The user can
-   accept, remove, or add sources. The user can also adjust the parsed triggers and schedule.
+Unlike the eternal watcher orchestrations in Section 3, the onboarding orchestration is **one-shot** -- it completes
+after the pipeline finishes and never calls `continue_as_new`.
 
-5. **Activation:** Once the user confirms, the watcher is created with `status = 'active'` and `next_check_at`
-   set to the first scheduled check time. For `specific_date` schedules, `next_check_at` is the specified datetime;
-   after the one-shot check completes, the watcher transitions to `'paused'`. No watcher activates with unresolved
-   ambiguity (F-01 AC-05, AC-06).
+### 5.2 Activity Functions
+
+Each pipeline step is an isolated activity function, independently retryable by the Durable Functions runtime:
+
+1. **`parse_watcher_prompt`** (LLM -- GPT-5.4 Nano): Extract topic, change triggers, and requested schedule from the
+   user's natural-language description. Input: description text + user's profile timezone. The schedule is produced as
+   one of the three discriminated-union types (`frequency`, `days_of_week`, or `specific_date`); if no schedule is
+   mentioned, the LLM defaults to `{"type": "frequency", "frequencyHours": 24, "preferredTime": "09:00"}` using the
+   user's profile timezone. If the description is ambiguous or incomplete (no clear topic, no identifiable change
+   triggers), the activity returns clarification questions instead of a parsed result.
+
+2. **`discover_sources`** (Tavily): Run targeted web searches based on the extracted topic. Input: parsed topic.
+   Output: list of discovered sources (official sites, publisher pages, prominent community hubs).
+
+3. **`assess_source_quality`** (LLM -- GPT-5.4 Nano): Evaluate each discovered source for relevance to the topic and
+   likely authority. Input: topic + source list. Output: sources with trust levels (`high`, `medium`, `low`), with
+   low-quality results filtered out.
+
+### 5.3 Custom Status Schema
+
+The orchestration updates its custom status at each step boundary. The frontend polls for this status and uses the
+`step` field to drive UI updates.
+
+| `step` value           | Set when                                | `data` payload                                                               |
+|------------------------|-----------------------------------------|------------------------------------------------------------------------------|
+| `parsing`              | Before `parse_watcher_prompt` activity  | None                                                                         |
+| `parsed`               | After prompt parsing completes          | `topic`, `changeTriggers`, `schedule` (Section 6 discriminated-union schema) |
+| `discovering`          | Before `discover_sources` activity      | None                                                                         |
+| `discovered`           | After source discovery completes        | `sources[]` with `id`, `type`, `value`, `label`                              |
+| `assessing`            | Before `assess_source_quality` activity | None                                                                         |
+| `assessed`             | After quality assessment completes      | `sources[]` with `id`, `type`, `value`, `label`, `trustLevel`                |
+| `clarification_needed` | When description is ambiguous           | `questions[]` (list of clarification strings)                                |
+
+Custom status JSON shape:
+
+```json
+{
+  "step": "parsed",
+  "data": {
+    "topic": "Silent Hill 1 Remake",
+    "changeTriggers": [
+      "new trailers",
+      "release date changes",
+      "delays"
+    ],
+    "schedule": {
+      "type": "frequency",
+      "frequencyHours": 24,
+      "preferredTime": "09:00"
+    }
+  }
+}
+```
+
+Terminal states are determined by the orchestration's `runtime_status` (`Completed`, `Failed`, `Terminated`), not by
+the custom status alone. A `runtime_status` of `Completed` with a custom status step of `clarification_needed` means
+the user must revise their description and resubmit.
+
+### 5.4 API Endpoints
+
+Two endpoints support the onboarding flow. Both use the `get_current_user` dependency for authentication.
+
+**`POST /api/watchers/onboard`** -- Start the onboarding orchestration.
+
+- Request body: `{ "description": "string" }` (1-2000 characters; HTML tags stripped server-side).
+- Response: `{ "instanceId": "string" }` (the Durable Functions orchestration instance ID).
+- The orchestration input includes the authenticated `user_id` alongside the description and timezone.
+- Returns HTTP 202 Accepted.
+
+**`GET /api/watchers/onboard/{instanceId}/status`** -- Poll orchestration progress.
+
+- Response: `{ "runtimeStatus": "string", "customStatus": { "step": "string", "data": ... }, "output": ... }`.
+- `runtimeStatus` is one of: `Pending`, `Running`, `Completed`, `Failed`, `Terminated`.
+- `customStatus` contains the latest step and accumulated data (Section 5.3 schema).
+- `output` is populated only when `runtimeStatus` is `Completed` and contains the final onboarding result.
+- **Ownership validation:** The endpoint reads the orchestration input's `user_id` and compares it against the
+  authenticated user. Returns HTTP 404 if they do not match, preventing users from polling other users' onboarding
+  sessions.
+
+### 5.5 Frontend Polling
+
+The frontend uses TanStack Query with `refetchInterval: 1500` (1.5 seconds) to poll the status endpoint while
+`runtimeStatus` is `Running` or `Pending`. The button label in the watcher creation UI updates based on the `step`
+field in `customStatus`:
+
+| `step` value              | Button label                    |
+|---------------------------|---------------------------------|
+| `parsing`                 | "Analyzing your description..." |
+| `parsed`, `discovering`   | "Discovering sources..."        |
+| `discovered`, `assessing` | "Assessing source quality..."   |
+
+Polling stops when `runtimeStatus` reaches a terminal state (`Completed`, `Failed`, `Terminated`). At that point:
+
+- **`Completed` + step `assessed`:** Transition to the review step with parsed config and sources pre-populated.
+- **`Completed` + step `clarification_needed`:** Display clarification questions; the user edits and resubmits.
+- **`Failed` or `Terminated`:** Show error; the user can resubmit.
+- **Frontend timeout (90 seconds without terminal state):** Stop polling, show error. The user can resubmit.
+
+Because orchestration state is persisted by Durable Functions, a page refresh during onboarding does not lose progress.
+The frontend can resume polling with the same `instanceId` (stored in component state or session storage).
+
+### 5.6 Post-Confirmation
+
+After the user reviews the parsed configuration and discovered sources (UX spec Section 2.4, Step 2), a separate
+`POST /api/watchers` creates the watcher with `status = 'active'` and `next_check_at` set to the first scheduled
+check time. This request signals the watcher's Durable Entity to activate (same lifecycle pattern as Section 3.1).
+
+For `specific_date` schedules, `next_check_at` is the specified datetime; after the one-shot check completes, the
+watcher transitions to `'paused'`. No watcher activates with unresolved ambiguity (F-01 AC-05, AC-06).
 
 ## 6. Data Models
 
@@ -651,12 +752,13 @@ contract for endpoint details, request/response schemas, and error formats.
 
 **Endpoint groups:**
 
-| Group    | Prefix           | Purpose                                       |
-|----------|------------------|-----------------------------------------------|
-| Watchers | `/api/watchers/` | CRUD, pause/resume, source list management    |
-| Alerts   | `/api/alerts/`   | List by watcher (paginated), mark as read     |
-| Webhooks | `/api/webhooks/` | CRUD webhook destinations, send test delivery |
-| Health   | `/api/health`    | Health check, no auth required                |
+| Group      | Prefix                  | Purpose                                       |
+|------------|-------------------------|-----------------------------------------------|
+| Watchers   | `/api/watchers/`        | CRUD, pause/resume, source list management    |
+| Onboarding | `/api/watchers/onboard` | Start onboarding orchestration, poll progress |
+| Alerts     | `/api/alerts/`          | List by watcher (paginated), mark as read     |
+| Webhooks   | `/api/webhooks/`        | CRUD webhook destinations, send test delivery |
+| Health     | `/api/health`           | Health check, no auth required                |
 
 Auth endpoints (`/api/auth/*`) are handled by Better Auth in the Next.js layer, not FastAPI.
 
@@ -692,6 +794,9 @@ FastAPI does NOT handle registration, login, or session creation. It only valida
   token with a valid `expires_at`, joins to the `users` table, and returns the authenticated user or raises
   HTTP 401.
 - All protected API endpoints use this dependency via `Depends(get_current_user)`.
+- The onboarding endpoints (`POST /api/watchers/onboard`, `GET /api/watchers/onboard/{instanceId}/status`) use the
+  same dependency. The status endpoint additionally validates that the authenticated user matches the `user_id` stored
+  in the orchestration input, returning HTTP 404 on mismatch to prevent cross-user status polling.
 
 ### Authorization
 
@@ -803,8 +908,8 @@ succeeds. It remains `false` only when every destination fails after exhausting 
 Resource Group: rg-omniwatcher-{env}
 ├── Functions App: func-omniwatcher-{env}             (Flex Consumption, FastAPI + monitoring)
 │   ├── HTTP triggers (FastAPI API via AsgiFunctionApp)
-│   ├── Durable orchestrations (one per active watcher)
-│   └── Activity functions (check executor, webhook delivery)
+│   ├── Durable orchestrations (one per active watcher + short-lived onboarding orchestrations)
+│   └── Activity functions (check executor, webhook delivery, onboarding pipeline steps)
 ├── Container Apps Environment: cae-omniwatcher-{env}
 │   └── Container App: ca-omniwatcher-web-{env}       (Next.js + Better Auth)
 ├── PostgreSQL Flexible Server: psql-omniwatcher-{env}  (B1ms, 32 GB Premium SSD)
@@ -890,7 +995,8 @@ docker compose up -d    # Starts: PostgreSQL, API server, Next.js dev server
 
 - All user input validated server-side with Pydantic models. Client-side validation exists for UX responsiveness
   but is never trusted.
-- Watcher descriptions: max 2000 characters, stripped of HTML tags on write.
+- Watcher descriptions: max 2000 characters, stripped of HTML tags on write. The same validation applies to the
+  onboarding endpoint (`POST /api/watchers/onboard`) -- descriptions are validated before the orchestration starts.
 - Source URLs: validated as HTTPS URLs. No HTTP, localhost, or private IP ranges.
 - Webhook destination URLs: validated as HTTPS URLs. No localhost or private IP ranges.
 - Webhook secrets: minimum 16 characters, generated server-side if not provided.
@@ -1001,6 +1107,14 @@ These break silently if violated.
 
 - **PostgreSQL storage auto-grow is disabled.** If enabled, storage grows but never shrinks. A temporary spike
   locks you into a higher tier permanently. Monitor storage usage; resize deliberately.
+
+- **Onboarding orchestrations must not call `continue_as_new`.** They are one-shot, not eternal. The orchestration
+  completes after the three activity functions finish. Calling `continue_as_new` would reset custom status and break
+  frontend polling.
+
+- **The onboarding status endpoint must validate user ownership.** The orchestration input includes `user_id`; the
+  endpoint must compare it against the authenticated user before returning status. Without this check, any
+  authenticated user could poll another user's onboarding progress by guessing the instance ID.
 
 ## 13. Architecture Decisions
 
@@ -1114,22 +1228,41 @@ hard-deletes after 30 days.
 N-04 (data minimization) and N-05 (intentional retention). Check rows older than 90 days are purged by the same
 cleanup job. Alert rows are purged alongside their parent watcher on hard delete.
 
+### AD-11: Durable Functions Orchestration with Polling for Onboarding Progress
+
+**Decision:** Run the onboarding pipeline as a Durable Functions orchestration with `set_custom_status()` for
+progress tracking. The frontend polls a status endpoint at 1.5-second intervals using TanStack Query.
+**Reasoning:** The onboarding pipeline (LLM parse, Tavily search, LLM assessment) takes 5-15 seconds. A synchronous
+endpoint risks timeout under load and provides no progress feedback. SSE was the initial candidate but is not viable:
+Azure Functions `AsgiFunctionApp` does not support HTTP streaming responses (confirmed by Microsoft in
+[azure-functions-python-extensions#102](https://github.com/Azure/azure-functions-python-extensions/issues/102),
+March 2025; support not planned). Durable Functions orchestrations with custom status provide a natural alternative
+already in the stack: the orchestration persists its progress at each step, the frontend polls via TanStack Query,
+and the user sees progressive status updates ("Analyzing...", "Discovering sources...", "Assessing quality...").
+Orchestration state survives page refreshes -- if the user reloads mid-onboarding, polling resumes from the current
+step. Alternatives considered: (1) **SSE** -- blocked by `AsgiFunctionApp` streaming limitation. (2)
+**WebSockets/SignalR** -- adds infrastructure and a new Azure resource for a 5-15 second interaction. (3) **Single
+blocking request** -- works but provides no progress feedback; the user stares at a static spinner for the full
+pipeline duration.
+
 ## 14. Scope Limits
 
 Numeric constraints for MVP cost control:
 
-| Limit                           | Value      | Rationale                                           |
-|---------------------------------|------------|-----------------------------------------------------|
-| Max watchers per user           | 25         | Bounds per-user scheduling and storage costs        |
-| Max sources per watcher         | 10         | Bounds per-check fetch and LLM token costs          |
-| Max webhook destinations / user | 5          | Sufficient for MVP, limits delivery fan-out         |
-| Min check frequency             | 1 hour     | Per PRD N-03                                        |
-| Max watcher description length  | 2000 chars | Bounds LLM input token costs                        |
-| Max alert summary length        | 1500 chars | Fits Discord 2000-char limit with metadata headroom |
-| Check execution timeout         | 5 minutes  | Prevents runaway checks from consuming resources    |
-| Session duration                | 7 days     | Rolling, managed by Better Auth                     |
-| Soft-delete retention           | 30 days    | Recovery window before hard purge                   |
-| Check history retention         | 90 days    | Purged by cleanup job, sufficient context window    |
+| Limit                           | Value       | Rationale                                           |
+|---------------------------------|-------------|-----------------------------------------------------|
+| Max watchers per user           | 25          | Bounds per-user scheduling and storage costs        |
+| Max sources per watcher         | 10          | Bounds per-check fetch and LLM token costs          |
+| Max webhook destinations / user | 5           | Sufficient for MVP, limits delivery fan-out         |
+| Min check frequency             | 1 hour      | Per PRD N-03                                        |
+| Max watcher description length  | 2000 chars  | Bounds LLM input token costs                        |
+| Max alert summary length        | 1500 chars  | Fits Discord 2000-char limit with metadata headroom |
+| Check execution timeout         | 5 minutes   | Prevents runaway checks from consuming resources    |
+| Onboarding poll interval        | 1.5 seconds | Balance between responsiveness and request volume   |
+| Onboarding poll timeout         | 90 seconds  | Frontend stops polling; shows error if not complete |
+| Session duration                | 7 days      | Rolling, managed by Better Auth                     |
+| Soft-delete retention           | 30 days     | Recovery window before hard purge                   |
+| Check history retention         | 90 days     | Purged by cleanup job, sufficient context window    |
 
 ---
 
