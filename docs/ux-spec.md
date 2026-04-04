@@ -2,12 +2,12 @@
 
 ## Document Header
 
-| Field          | Value           |
-|----------------|-----------------|
-| Version        | v1.1            |
-| Date           | 2026-03-30      |
-| Author         | Brandon Avant   |
-| Change Summary | Add progressive status updates for watcher creation onboarding |
+| Field          | Value                                                                               |
+|----------------|-------------------------------------------------------------------------------------|
+| Version        | v1.2                                                                                |
+| Date           | 2026-04-01                                                                          |
+| Author         | Brandon Avant                                                                       |
+| Change Summary | Add viewport meta tag, mobile input handling, orientation, and performance guidance |
 
 ---
 
@@ -28,6 +28,24 @@
 | Mobile     | < 768px      | Navigation collapses to hamburger menu. Content fills full viewport width. |
 | Tablet     | 768 - 1024px | Top-bar navigation visible. Content container max-width 720px.             |
 | Desktop    | > 1024px     | Top-bar navigation visible. Content container max-width 960px.             |
+
+### Viewport Configuration
+
+The application must include the following viewport meta tag:
+
+```html
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+```
+
+**Rules:**
+
+- Do NOT set `maximum-scale` or `user-scalable=no`. Users must be able to pinch-to-zoom for accessibility (WCAG 1.4.4
+  Resize Text). The iOS auto-zoom issue on form fields is solved by rendering inputs at 16px or larger (see Section 3
+  Form Validation), not by disabling zoom.
+- Do not set `minimum-scale`. The browser default is acceptable.
+- Next.js sets this tag automatically via the `metadata` export in `app/layout.tsx`. Verify it is present and not
+  overridden.
 
 ## 2. Screen Specifications
 
@@ -213,7 +231,8 @@ stacked vertically.
         - An "x" button to remove the source.
     - An "Add source" button opens an inline form:
         - Type selector: "URL" or "Search query".
-        - Value input: URL field (validated as HTTPS) or free-text search query.
+        - Value input: URL field (`type="url"`, `inputmode="url"`, validated as HTTPS) or free-text search query
+          (`inputmode="search"`).
         - Label input: user-facing name.
         - "Add" button.
     - At least one source is required. Removing the last source shows an inline error: "At least one source is
@@ -354,7 +373,7 @@ A modal dialog with fields:
 - **Name** (text input, required, max 100 characters).
 - **Type** selector: "Generic webhook" or "Discord webhook" (radio buttons). Selecting a type updates the hint text
   on the URL field.
-- **URL** (text input, required, validated as HTTPS URL).
+- **URL** (text input, `type="url"`, `inputmode="url"`, required, validated as HTTPS URL).
     - Generic hint: "The HTTPS endpoint that will receive POST requests."
     - Discord hint: "Paste your Discord webhook URL (starts with https://discord.com/api/webhooks/)."
 - **Set as default** checkbox. If checked, this destination becomes the default. Only one destination can be default.
@@ -430,6 +449,47 @@ creation, the secret is shown once in a success dialog: "Webhook destination cre
   messages below the relevant field with a red border on the field.
 - **Server-side validation** is authoritative. Client-side validation is for UX responsiveness only.
 - Error messages are specific: "Email must be a valid email address", not "Invalid input."
+- **Mobile input sizing:** All `<input>`, `<select>`, and `<textarea>` elements must render text at 16px or larger on
+  viewports below 768px. This prevents iOS Safari from auto-zooming the page when a form field receives focus. See
+  brand-identity.md Section 4 "Responsive Type Scale" for the authoritative rule.
+
+### Mobile Input Handling
+
+#### Input Mode Attributes
+
+Every form field must specify the correct `type` and `inputmode` attributes to invoke the appropriate mobile keyboard.
+
+| Field                                 | `type`     | `inputmode` | Keyboard Behavior            |
+|---------------------------------------|------------|-------------|------------------------------|
+| Email (login, register)               | `email`    | `email`     | Shows @ and . keys           |
+| Password (login, register, settings)  | `password` | --          | Secure entry                 |
+| Name (register, settings)             | `text`     | `text`      | Standard keyboard            |
+| URL (webhook destination, source add) | `url`      | `url`       | Shows / and .com keys        |
+| Search query (source add)             | `text`     | `search`    | Shows search/go key          |
+| Description (watcher creation)        | --         | `text`      | Standard keyboard (textarea) |
+| Time picker (schedule)                | `time`     | --          | Native time picker           |
+| Date picker (specific date schedule)  | `date`     | --          | Native date picker           |
+
+#### Virtual Keyboard and Viewport
+
+- Use the Visual Viewport API (`window.visualViewport`) to detect keyboard appearance rather than relying on
+  `window.innerHeight` changes, which are unreliable across browsers.
+- **Scroll-on-focus:** When a field receives focus and the keyboard appears, scroll the field into view using
+  `Element.scrollIntoView({ block: 'center', behavior: 'smooth' })` after a 100ms delay (to allow the keyboard
+  animation to settle).
+- **Toast anchoring:** Fixed-position toasts must anchor to the visual viewport. When the keyboard is open, toasts
+  appear above the keyboard, not behind it.
+- **No pinned bottom buttons alongside keyboard.** Bottom-aligned action buttons (watcher creation "Continue", watcher
+  edit "Save changes") should scroll into view naturally with the form, not be pinned to the visual viewport bottom.
+  Pinned buttons consume too much of the already-reduced viewport when the keyboard is open.
+
+#### Focus Management on Mobile
+
+- **Validation errors:** On form submission failure on mobile, scroll the first errored field into view and focus it.
+- **Modal open (full-screen on mobile):** Focus the first interactive element. On close, return focus to the trigger
+  element.
+- **Step navigation (watcher creation):** When transitioning between steps, focus the first interactive element of the
+  new step.
 
 ## 4. Accessibility
 
@@ -464,18 +524,72 @@ creation, the secret is shown once in a success dialog: "Webhook destination cre
 | Dialogs (modal)        | Full-screen               | Centered (max 480px)     | Centered (max 480px)     |
 | Settings card          | Full-width                | Centered (max 720px)     | Centered (max 720px)     |
 | Toasts                 | Bottom-center, full-width | Bottom-right (max 360px) | Bottom-right (max 360px) |
+| Touch targets          | 44px min tap area         | 44px (pointer: coarse)   | Standard sizes           |
+
+### Orientation Handling
+
+OmniWatcher supports both portrait and landscape on all devices. The app does not lock orientation via the Screen
+Orientation API or `manifest.json`.
+
+**Landscape on phones** (< 768px width in portrait, typically < 400px height in landscape):
+
+- Top bar remains in hamburger mode (orientation does not change the breakpoint).
+- Full-screen dialogs remain full-screen but scroll vertically if content exceeds the reduced viewport height.
+- Watcher creation Step 1 textarea: reduce minimum rows from 6 to 3 in landscape to leave room for the submit button
+  above the fold.
+- Form fields remain single-column. Do not switch to multi-column in landscape on phones -- the ~700px landscape width
+  approaches but does not reach the tablet breakpoint, and multi-column on a phone creates awkwardly narrow columns.
+- When viewport height is below 400px with the keyboard open, collapse the step indicator to a single-line text format
+  ("Step 1 of 3") instead of the full visual indicator. This preserves the step context without consuming scarce
+  vertical space.
+
+**Landscape on tablets:** No special treatment needed. Tablet landscape typically exceeds 1024px width, which triggers
+desktop layout automatically via the breakpoint system.
+
+### Mobile Performance
+
+#### Image Handling
+
+OmniWatcher is a text-first interface at MVP (see brand-identity.md Section 8). There are no content images -- visual
+richness comes from typography, color, and whitespace. The only raster assets are logo PNG variants (favicon, PWA
+icons, OG image), which are loaded once and browser-cached. Lucide icons are imported as individual SVG components, not
+as a sprite sheet or full icon font.
+
+#### Lazy Loading
+
+- **Route-based code splitting** is automatic via Next.js `app/` router. No additional configuration needed.
+- **Modal and dialog components** (confirmation dialogs, webhook add/edit dialog) should be lazy-loaded using
+  `next/dynamic` with `ssr: false` to keep them out of the initial bundle.
+- **Alert history pagination** (Section 2.5) already avoids loading all alerts upfront (20 per page with "Load more").
+
+#### Network Resilience
+
+- **Offline indicator:** When `navigator.onLine` is false or the `offline` event fires, display a subtle top banner:
+  "You're offline. Changes will sync when you reconnect." in `--color-warning` text on `--bg-surface`. Dismiss
+  automatically on reconnection.
+- **API request timeout:** 15 seconds. Show the standard network error toast on timeout (see Section 6).
+- **Prefetch policy:** Next.js's default viewport-intersection prefetch for `next/link` is acceptable. Do not add
+  custom aggressive prefetch logic. Respect the `Save-Data` client hint if present by disabling prefetch
+  (`next/link` with `prefetch={false}`).
+
+#### Bundle Considerations
+
+- Keep total JavaScript bundle under 200KB gzipped for initial page load. No heavy client-side dependencies beyond
+  React, Next.js, and the Tailwind runtime.
+- Geist Sans and Geist Mono are loaded via `next/font` with automatic self-hosting, subsetting, and `display: swap`
+  to prevent flash of invisible text on slower connections.
 
 ## 6. Error States Summary
 
-| Error             | Display                    | Recovery                                                                |
-|-------------------|----------------------------|-------------------------------------------------------------------------|
-| Network failure   | Toast, auto-retry          | "Unable to reach the server. Please try again." after 3 retries         |
-| Validation error  | Inline below input         | Fix input and resubmit                                                  |
-| 401 Unauthorized  | Redirect to `/login`       | Log in again                                                            |
-| 403 Forbidden     | Full-page message          | "You don't have access to this resource." with "Go to watchers" link    |
-| 404 Not Found     | Full-page message          | "This page doesn't exist." with "Go to watchers" link                   |
-| 500 Server Error  | Toast                      | "Something went wrong. Please try again."                               |
-| Watcher not found | Full-page message          | "This watcher doesn't exist or has been deleted." with "Go to watchers" |
-| No webhook dest.  | Warning banner on creation | "No webhook destinations configured." with link to `/webhooks`          |
-| Onboarding failure  | Inline error above button (Step 1) | Button reverts to "Continue"; user resubmits                  |
-| Onboarding timeout  | Same as onboarding failure         | User resubmits; no automatic retry                            |
+| Error              | Display                            | Recovery                                                                |
+|--------------------|------------------------------------|-------------------------------------------------------------------------|
+| Network failure    | Toast, auto-retry                  | "Unable to reach the server. Please try again." after 3 retries         |
+| Validation error   | Inline below input                 | Fix input and resubmit                                                  |
+| 401 Unauthorized   | Redirect to `/login`               | Log in again                                                            |
+| 403 Forbidden      | Full-page message                  | "You don't have access to this resource." with "Go to watchers" link    |
+| 404 Not Found      | Full-page message                  | "This page doesn't exist." with "Go to watchers" link                   |
+| 500 Server Error   | Toast                              | "Something went wrong. Please try again."                               |
+| Watcher not found  | Full-page message                  | "This watcher doesn't exist or has been deleted." with "Go to watchers" |
+| No webhook dest.   | Warning banner on creation         | "No webhook destinations configured." with link to `/webhooks`          |
+| Onboarding failure | Inline error above button (Step 1) | Button reverts to "Continue"; user resubmits                            |
+| Onboarding timeout | Same as onboarding failure         | User resubmits; no automatic retry                                      |
