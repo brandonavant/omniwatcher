@@ -1,7 +1,6 @@
 ---
 name: create-github-issue
-description: Create GitHub issues with deterministic commands, transient failure recovery, and content validation. Use when creating one or more GitHub issues to ensure the final issue body on GitHub matches what was intended.
-disable-model-invocation: true
+description: Invoke this skill when creating, filing, opening, submitting, or writing a GitHub issue. Triggers on phrases like "create issue", "file an issue", "open an issue", "turn this into an issue", or "make a GitHub issue".
 allowed-tools: Bash, Read, Write, Glob, Grep
 ---
 

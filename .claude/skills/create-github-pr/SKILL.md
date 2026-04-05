@@ -1,7 +1,6 @@
 ---
 name: create-github-pr
-description: Create GitHub pull requests with deterministic commands, transient failure recovery, and content validation. Use when creating a pull request to ensure the final PR body on GitHub matches what was intended.
-disable-model-invocation: true
+description: Invoke this skill when creating, opening, or submitting a GitHub pull request. Triggers on phrases like "create a PR", "open a pull request", "submit a PR", or "make a PR".
 allowed-tools: Bash, Read, Write, Glob, Grep
 ---
 
