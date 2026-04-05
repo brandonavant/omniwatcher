@@ -1,0 +1,62 @@
+name: Skill Tests
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.claude/skills/**'
+      - 'pyproject.toml'
+      - 'uv.lock'
+      - '.github/workflows/skill-tests.yml'
+  pull_request:
+    paths:
+      - '.claude/skills/**'
+      - 'pyproject.toml'
+      - 'uv.lock'
+      - '.github/workflows/skill-tests.yml'
+
+jobs:
+  test-skills:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Install Python
+        run: uv python install
+
+      - name: Discover and run skill tests
+        run: |
+          tested=0
+          failed=0
+
+          for scripts_dir in .claude/skills/*/scripts/; do
+            [ -d "$scripts_dir" ] || continue
+
+            test_files=$(find "$scripts_dir" -maxdepth 1 -name 'test_*.py' 2>/dev/null)
+            [ -n "$test_files" ] || continue
+
+            skill_name=$(basename "$(dirname "$scripts_dir")")
+            echo "::group::$skill_name"
+            tested=$((tested + 1))
+
+            if (cd "$scripts_dir" && uv run python -m pytest test_*.py -v); then
+              echo "  ✓ $skill_name passed"
+            else
+              echo "  ✗ $skill_name failed"
+              failed=$((failed + 1))
+            fi
+
+            echo "::endgroup::"
+          done
+
+          echo ""
+          echo "--- Summary ---"
+          echo "$tested skill(s) tested, $failed failed."
+
+          if [ "$failed" -gt 0 ]; then
+            exit 1
+          fi
