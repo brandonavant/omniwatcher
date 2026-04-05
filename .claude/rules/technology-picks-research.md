@@ -33,10 +33,13 @@ Before presenting a pick, you must verify the following via web search:
    current versions of adjacent tools?
 5. **Alternatives.** Have newer or better-fit options emerged since training? Search explicitly for "[category]
    alternatives 2026" or similar.
-6. **Runtime compatibility (GitHub Actions only).** Check the action's releases page for the latest major version and
-   confirm it supports the current GitHub-required Node.js runtime. GitHub periodically deprecates older Node.js
-   versions and forces actions to upgrade — using a stale major version will produce deprecation warnings and
-   eventually break.
+6. **GitHub Actions version verification.** For every `uses:` directive:
+   - **Verify the major-version tag exists** by running `gh api repos/{owner}/{repo}/git/refs/tags --jq '.[].ref'`
+     and confirming the `v<N>` tag is present. A release like `v8.0.0` does NOT guarantee the `v8` major-version
+     alias tag exists — maintainers create these separately, sometimes days or weeks after the release. Using a
+     non-existent tag will fail the workflow immediately.
+   - **Check Node.js runtime compatibility.** GitHub periodically deprecates older Node.js versions and forces
+     actions to upgrade. Using a stale major version will produce deprecation warnings and eventually break.
 7. **Supply chain risk assessment.** For every third-party dependency, evaluate:
    - **Maintainer count and bus factor.** Single-maintainer projects with no organizational backing are high risk.
      Search for the project on Snyk Advisor or Socket.dev for health scores.
