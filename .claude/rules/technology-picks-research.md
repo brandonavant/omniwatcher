@@ -16,6 +16,8 @@ Any response that includes or relies on:
 - A claim that something is deprecated, unmaintained, or end-of-life
 - A comparison of competing tools or services
 - A rejection of a technology option (you must verify the reason for rejection is still accurate)
+- A GitHub Actions `uses:` directive with a version tag (these are third-party dependencies and go stale just as fast
+  as npm/PyPI packages)
 
 ## Required research steps
 
@@ -31,7 +33,11 @@ Before presenting a pick, you must verify the following via web search:
    current versions of adjacent tools?
 5. **Alternatives.** Have newer or better-fit options emerged since training? Search explicitly for "[category]
    alternatives 2026" or similar.
-6. **Supply chain risk assessment.** For every third-party dependency, evaluate:
+6. **Runtime compatibility (GitHub Actions only).** Check the action's releases page for the latest major version and
+   confirm it supports the current GitHub-required Node.js runtime. GitHub periodically deprecates older Node.js
+   versions and forces actions to upgrade — using a stale major version will produce deprecation warnings and
+   eventually break.
+7. **Supply chain risk assessment.** For every third-party dependency, evaluate:
    - **Maintainer count and bus factor.** Single-maintainer projects with no organizational backing are high risk.
      Search for the project on Snyk Advisor or Socket.dev for health scores.
    - **Release recency.** No releases in 12+ months with no explanation is a red flag for both staleness and
